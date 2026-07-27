@@ -1,0 +1,13 @@
+# Базовые зависимости (работают ВЕЗДЕ, без ROS/железа) — vision/, agents/,
+# swarm/, openclaw.middleware, mission_runner.py --sim
+numpy>=1.24
+Pillow>=10.0
+PyYAML>=6.0
+requests>=2.31
+
+# Тесты
+pytest>=7.4
+
+# --live режим (реальный полёт) требует ОТДЕЛЬНО установленного ROS 2
+# (Humble/Iron) и пакета sverk_interfaces из https://github.com/sverk-tech/sverk-ros2
+# — они НЕ ставятся через pip, см. README.md, раздел «Установка».
