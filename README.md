@@ -2,7 +2,7 @@
 
 Полное программное решение для очного этапа инженерного соревнования
 [«Архипелаг 2026»](https://github.com/sverk-tech/sverk-ros2): автономное
-художественное рисование ромом из 4 квадрокоптеров «Сверх», управляемое
+художественное рисование роем из 4 квадрокоптеров «Сверх», управляемое
 мультиагентной LLM-системой с интеграцией через собственный слой **OpenCLaw**,
 построенный на базе [sverk-ros2](https://github.com/sverk-tech/sverk-ros2).
 
@@ -50,7 +50,7 @@
 ## Установка
 
 ```bash
-git clone <этот репозиторий>
+git clone https://github.com/sugar3434/sverk-swarm-artist
 cd sverk-swarm-artist
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
