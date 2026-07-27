@@ -50,9 +50,11 @@
 ## Установка
 
 ```bash
-git clone https://github.com/sugar3434/sverk-swarm-artist
+git clone https://github.com/sugar3434/sverk-swarm-artist.git
 cd sverk-swarm-artist
-python3 -m venv .venv && source .venv/bin/activate
+py -3 -m venv .venv
+.\.venv\Scripts\activate
+python -m pip install --upgrade pip setuptools wheel
 pip install -r requirements.txt
 ```
 
