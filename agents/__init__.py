@@ -1,10 +1,18 @@
-"""
-Пакет agents — мультиагентная система публичного диалога роя дронов-художников.
+"""Multi-persona LLM agent system for Sverk PikoClaw Swarm."""
+from agents.personas import (
+    COLOR_TO_AGENT,
+    AGENT_TO_COLOR,
+    AGENT_TO_DRONE,
+    PERSONA_SPEEDS,
+    get_agent_prompt,
+    get_coordinator_prompt,
+)
 
-Содержит 4 личности-художника, координатора, абстракцию LLM-клиента
-(с офлайн-заглушкой и надёжным HTTP-клиентом с fallback) и движок диалога,
-формирующий итоговый Plan покраски.
-
-Модуль полностью автономен от ROS/дрона: НЕ импортирует rclpy и sverk_interfaces
-(см. docs/ARCHITECTURE_CONTRACT.md). Работает и тестируется офлайн.
-"""
+__all__ = [
+    "COLOR_TO_AGENT",
+    "AGENT_TO_COLOR",
+    "AGENT_TO_DRONE",
+    "PERSONA_SPEEDS",
+    "get_agent_prompt",
+    "get_coordinator_prompt",
+]

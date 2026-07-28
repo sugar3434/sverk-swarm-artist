@@ -1,240 +1,224 @@
-"""
-Движок публичного диалога 4 личностей + координатора роя дронов-художников.
+"""Multi-agent dialogue engine for Sverk PikoClaw Swarm platform.
 
-Алгоритм run_dialogue():
-    1. Транслируем системное сообщение о получении промпта.
-    2. До `rounds` раундов (но не дольше `time_budget_s`, т.к. время диалога
-       входит в общий 15-минутный лимит попытки): по очереди опрашиваем
-       Академиста, Экспрессиониста, Минималиста и Детализатора, транслируем
-       их реплики, пытаемся извлечь из ответа JSON-патч с предложениями и
-       аккуратно применяем его к рабочей копии плана (без падения, если
-       патч кривой или ссылается на несуществующую ячейку).
-    3. Вызываем координатора с финальным списком задач, просим строгий JSON
-       итогового плана. Если разбор не удался — деградируем к последней
-       рабочей копии draft_tasks (безопасный fallback, миссия не должна
-       останавливаться из-за кривого JSON от реальной LLM).
-    4. Возвращаем Plan с итоговыми ячейками и полной стенограммой диалога.
-
-Любая ошибка (сеть, парсинг, неверный формат) перехватывается и логируется
-через broadcaster, деградируя к безопасному плану — диалог не должен
-прерывать миссию. Модуль полностью автономен от ROS/дрона: НЕ импортирует
-rclpy/sverk_interfaces.
+Manages multi-round discussion between painter persona agents («Академист», «Экспрессионист»,
+«Минималист», «Детализатор») and final plan synthesis by Coordinator.
+Operates strictly online under Zero Offline Mode.
 """
 from __future__ import annotations
 
 import copy
 import json
-import math
-import queue
+import logging
 import re
 import threading
 import time
-from dataclasses import asdict
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Union
 
-from common.schema import COLORS, DialogueTurn, PaintTask, Plan
-
+from common.schema import COLORS, DialogueTurn, FlightCommand, PaintTask, Plan, PERSONA_SPEEDS
 from agents.broadcast import Broadcaster
-from agents.llm_client import LLMClient
-from agents.personas import COORDINATOR_PROMPT, PERSONAS
+from agents.llm_client import LLMClient, LLMConnectionError
+from agents.personas import (
+    COLOR_TO_AGENT,
+    AGENT_TO_DRONE,
+    get_agent_prompt,
+    get_coordinator_prompt,
+)
 
-# Порядок реплик в каждом раунде — фиксирован регламентом ролей:
-# Академист -> Экспрессионист -> Минималист -> Детализатор.
-PERSONA_ORDER: List[str] = ["Академист", "Экспрессионист", "Минималист", "Детализатор"]
-
-_JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
-
-
-def _tasks_to_json(tasks: List[PaintTask]) -> str:
-    """Сериализовать список PaintTask в компактный JSON для промпта LLM."""
-    return json.dumps([asdict(t) for t in tasks], ensure_ascii=False)
+logger = logging.getLogger("sverk.dialogue_engine")
 
 
 def _chat_before_deadline(
     llm: LLMClient,
     system_prompt: str,
     user_prompt: str,
-    deadline: float,
+    deadline_ts: float,
 ) -> str:
-    """Выполнить синхронный LLM-вызов, не позволив ему превысить общий дедлайн.
-
-    Клиентский HTTP-таймаут может быть больше бюджета всего диалога. Поэтому
-    вызов идёт в daemon-потоке, а основной поток ждёт только оставшееся время.
+    """Executes network LLM request in a daemon thread with deadline watchdog.
+    
+    Raises TimeoutError or LLMConnectionError on failure without offline fallbacks.
     """
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise TimeoutError("бюджет времени диалога исчерпан")
+    remaining_s = deadline_ts - time.time()
+    if remaining_s <= 0.0:
+        raise TimeoutError("Time budget for LLM dialogue expired before request start.")
 
-    result_queue: queue.Queue = queue.Queue(maxsize=1)
+    result_box: List[str] = []
+    error_box: List[Exception] = []
 
-    def invoke() -> None:
+    def _worker() -> None:
         try:
-            result_queue.put((True, llm.chat(system_prompt, user_prompt)))
-        except Exception as exc:  # noqa: BLE001
-            result_queue.put((False, exc))
+            res = llm.chat(system_prompt, user_prompt, timeout_s=remaining_s)
+            result_box.append(res)
+        except Exception as exc:
+            error_box.append(exc)
 
-    threading.Thread(target=invoke, daemon=True).start()
-    try:
-        ok, value = result_queue.get(timeout=remaining)
-    except queue.Empty as exc:
-        raise TimeoutError("LLM-вызов превысил бюджет времени диалога") from exc
-    if not ok:
-        raise value
-    return value
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+    thread.join(timeout=remaining_s)
 
+    if thread.is_alive():
+        raise TimeoutError(f"LLM API call exceeded deadline budget ({remaining_s:.2f} s).")
+    if error_box:
+        exc = error_box[0]
+        if isinstance(exc, LLMConnectionError):
+            logger.error("Critical failure of LLM connection: %s. Zero Offline Mode prevents fallback.", exc)
+            raise exc
+        raise exc
+    if not result_box:
+        raise TimeoutError("LLM call completed without text content.")
 
-def _ensure_meaningful_priorities(tasks: List[PaintTask]) -> None:
-    """Назначить стабильные приоритеты, если координатор оставил все нулевыми.
-
-    Контур идёт первым как регистрационная направляющая композиции, затем
-    заливки. Уникальный ранг внутри групп делает сортировку планировщика
-    фактически полезной, а не формальной.
-    """
-    if len(tasks) < 2 or any(task.priority != 0 for task in tasks):
-        return
-    indexed = list(enumerate(tasks))
-    ordered = sorted(
-        indexed,
-        key=lambda pair: (
-            0
-            if (
-                pair[1].color == "black"
-                or "контурн" in pair[1].note.lower()
-                or "академист" in pair[1].note.lower()
-            )
-            else 1,
-            pair[0],
-        ),
-    )
-    for priority, (_original_index, task) in enumerate(ordered):
-        task.priority = priority
+    return result_box[0]
 
 
-def _extract_first_json_object(text: str) -> Optional[dict]:
-    """Найти и разобрать первый JSON-объект {...} в произвольном тексте.
-
-    Возвращает None, если объект не найден или не парсится — вызывающий код
-    в этом случае просто использует текст реплики без патча, не падая.
-    Если в тексте несколько кандидатов (жадный поиск может захватить лишнее),
-    последовательно сужаем совпадение справа, чтобы найти валидный JSON.
-    """
-    match = _JSON_OBJECT_RE.search(text)
-    if not match:
+def extract_json(text: str) -> Optional[Any]:
+    """Extracts and parses JSON object from raw LLM text response."""
+    if not text:
         return None
-    candidate = match.group(0)
-    # Жадный regex мог захватить слишком много (например, два JSON-объекта
-    # подряд или мусор после) — пробуем последовательно обрезать с конца,
-    # пока не найдём валидный JSON или не иссякнут варианты.
-    for end in range(len(candidate), 0, -1):
-        chunk = candidate[:end]
-        if not chunk.endswith("}"):
-            continue
+
+    # 1. Search inside markdown code fence
+    match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, re.IGNORECASE)
+    if match:
         try:
-            return json.loads(chunk)
-        except (json.JSONDecodeError, ValueError):
-            continue
-    return None
+            return json.loads(match.group(1).strip())
+        except json.JSONDecodeError:
+            pass
 
-
-def _apply_patch(tasks: List[PaintTask], patch: dict, agent: str, broadcaster: Broadcaster) -> None:
-    """Применить JSON-патч предложений агента к рабочей копии списка задач.
-
-    Патч ожидается в виде {"suggest": [{"cell": ..., "action": ..., ...}]}.
-    Некорректные или ссылающиеся на несуществующую ячейку записи молча
-    (но с логом в трансляцию) пропускаются — они не должны прерывать диалог.
-    """
-    suggestions = patch.get("suggest")
-    if not isinstance(suggestions, list):
-        return
-
-    by_cell = {t.cell: t for t in tasks}
-
-    for item in suggestions:
-        if not isinstance(item, dict):
-            continue
-        cell_id = item.get("cell")
-        action = item.get("action")
-
-        if not isinstance(cell_id, str) or cell_id not in by_cell:
-            broadcaster.emit(
-                DialogueTurn(
-                    agent="Система",
-                    text=(
-                        f"Предложение @{agent} по ячейке '{cell_id}' проигнорировано: "
-                        f"такой ячейки нет в текущем плане."
-                    ),
-                )
-            )
-            continue
-
-        task = by_cell[cell_id]
-
+    # 2. Search between first opening and last closing bracket
+    start_idx = -1
+    for i, ch in enumerate(text):
+        if ch in ("{", "["):
+            start_idx = i
+            break
+    end_idx = -1
+    for i in range(len(text) - 1, -1, -1):
+        if text[i] in ("}", "]"):
+            end_idx = i
+            break
+    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
         try:
-            if action == "remove":
-                if task in tasks:
-                    tasks.remove(task)
-                    del by_cell[cell_id]
-            elif action == "recolor":
-                new_color = item.get("color")
-                if new_color in COLORS:
-                    task.color = new_color
-                elif new_color is not None:
-                    raise ValueError(f"неизвестный цвет {new_color!r}")
-            elif action == "extend_duration":
-                delta = float(item.get("delta_duration_s", 0.0))
-                new_duration = task.duration_s + delta
-                if math.isfinite(new_duration) and new_duration > 0:
-                    task.duration_s = new_duration
-            elif action == "add_pass":
-                task.passes += 1
-            elif action == "keep":
-                pass
-            else:
-                broadcaster.emit(
-                    DialogueTurn(
-                        agent="Система",
-                        text=f"Неизвестное действие '{action}' от @{agent} по ячейке '{cell_id}' проигнорировано.",
-                    )
-                )
-        except (ValueError, TypeError) as exc:
-            broadcaster.emit(
-                DialogueTurn(
-                    agent="Система",
-                    text=f"Патч от @{agent} по ячейке '{cell_id}' некорректен и проигнорирован ({exc}).",
-                )
-            )
+            return json.loads(text[start_idx : end_idx + 1])
+        except json.JSONDecodeError:
+            pass
+
+    # 3. Direct JSON parse attempt
+    try:
+        return json.loads(text.strip())
+    except json.JSONDecodeError:
+        return None
 
 
-def _safe_plan_from_draft(prompt: str, tasks: List[PaintTask], transcript: List[DialogueTurn], notes: str) -> Plan:
-    """Собрать безопасный Plan на основе рабочей копии draft-задач (fallback)."""
-    return Plan(prompt=prompt, cells=list(tasks), transcript=list(transcript), notes=notes)
+def apply_json_suggestions(
+    tasks: List[PaintTask],
+    suggestions_data: Union[Dict[str, Any], List[Dict[str, Any]], str, Any],
+) -> List[PaintTask]:
+    """Applies LLM agent suggestions to current task list subject to competition constraints."""
+    if isinstance(suggestions_data, str):
+        suggestions_data = extract_json(suggestions_data)
 
+    if not suggestions_data:
+        return tasks
 
-def _coordinator_json_to_tasks(data: dict, allowed_cells: Optional[set[str]] = None) -> List[PaintTask]:
-    """Преобразовать разобранный JSON координатора в список валидных PaintTask.
+    suggestions_list: List[Dict[str, Any]] = []
+    if isinstance(suggestions_data, dict):
+        if "suggestions" in suggestions_data and isinstance(suggestions_data["suggestions"], list):
+            suggestions_list = [item for item in suggestions_data["suggestions"] if isinstance(item, dict)]
+        elif "action" in suggestions_data:
+            suggestions_list = [suggestions_data]
+    elif isinstance(suggestions_data, list):
+        suggestions_list = [item for item in suggestions_data if isinstance(item, dict)]
 
-    Может бросить исключение (ValueError и т.п.) при некорректных данных —
-    вызывающий код обязан перехватить его и деградировать к draft-плану.
-    """
-    cells_raw = data["cells"]
-    if not isinstance(cells_raw, list):
-        raise ValueError("Поле 'cells' не список")
+    if not suggestions_list:
+        return tasks
 
-    result: List[PaintTask] = []
-    for item in cells_raw:
-        if allowed_cells is not None and item.get("cell") not in allowed_cells:
+    updated = [copy.deepcopy(t) for t in tasks]
+
+    for item in suggestions_list:
+        action = str(item.get("action", "")).strip().lower()
+        cell = str(item.get("cell", "")).strip()
+        if not action or not cell:
             continue
-        result.append(
-            PaintTask(
-                cell=item["cell"],
-                color=item["color"],
-                duration_s=float(item.get("duration_s", 1.5)),
-                passes=int(item.get("passes", 1)),
-                priority=int(item.get("priority", 0)),
-                note=str(item.get("note", "")),
+
+        if action == "remove":
+            updated = [t for t in updated if t.cell != cell]
+            continue
+
+        for t in updated:
+            if t.cell == cell:
+                if action == "add_pass":
+                    add_count = int(item.get("amount", item.get("passes", 1)))
+                    t.passes = min(3, max(1, t.passes + add_count))
+                elif action == "extend_duration":
+                    amount_s = float(item.get("amount_s", 1.0))
+                    t.duration_s = min(5.0, max(0.1, t.duration_s + amount_s))
+                elif action == "recolor":
+                    new_color = str(item.get("color", "")).strip().lower()
+                    if new_color in COLORS:
+                        t.color = new_color
+                note_add = item.get("note")
+                if note_add and isinstance(note_add, str):
+                    t.note = (t.note + f" [{note_add}]").strip() if t.note else note_add.strip()
+
+    return updated
+
+
+# Alias for compatibility
+apply_json_patch = apply_json_suggestions
+
+
+def synthesize_default_flight_commands(tasks: List[PaintTask]) -> List[FlightCommand]:
+    """Synthesizes default sequence of flight commands based on persona velocities."""
+    commands: List[FlightCommand] = []
+    for t in tasks:
+        agent = COLOR_TO_AGENT.get(t.color, "Академист")
+        drone_id = AGENT_TO_DRONE.get(agent, "drone_black")
+        persona_speed = PERSONA_SPEEDS.get(t.color, 1.0)
+        
+        commands.append(
+            FlightCommand(
+                drone_id=drone_id,
+                action="takeoff",
+                z=2.0,
+                speed_mps=persona_speed,
+                duration_s=3.0,
+                note=f"Takeoff for {drone_id} to service cell {t.cell}",
             )
         )
-    return result
+        commands.append(
+            FlightCommand(
+                drone_id=drone_id,
+                action="navigate",
+                x=t.x or 0.0,
+                y=t.y or 0.0,
+                z=2.0,
+                speed_mps=persona_speed,
+                note=f"Navigate to ARUCO frame position for cell {t.cell}",
+            )
+        )
+        commands.append(
+            FlightCommand(
+                drone_id=drone_id,
+                action="paint_zone",
+                x=t.x or 0.0,
+                y=t.y or 0.0,
+                z=2.0,
+                speed_mps=persona_speed,
+                duration_s=t.duration_s,
+                passes=t.passes,
+                note=f"PikoClaw spray {t.color} ({t.passes} passes, {t.duration_s}s)",
+            )
+        )
+        commands.append(
+            FlightCommand(
+                drone_id=drone_id,
+                action="land",
+                x=0.0,
+                y=0.0,
+                z=0.0,
+                speed_mps=persona_speed,
+                duration_s=3.0,
+                note=f"Land {drone_id} at origin",
+            )
+        )
+    return commands
 
 
 def run_dialogue(
@@ -243,214 +227,132 @@ def run_dialogue(
     llm: LLMClient,
     broadcaster: Broadcaster,
     rounds: int = 2,
-    time_budget_s: float = 180.0,
+    time_budget_s: float = 60.0,
 ) -> Plan:
-    """Провести публичный диалог 4 личностей + координатора и вернуть Plan.
-
-    Параметры:
-        prompt        — исходный текстовый промпт задания (например, "нарисуй сокола").
-        draft_tasks   — черновой список PaintTask (из vision/bitmap_to_plan.py),
-                        который агенты обсуждают и правят своими предложениями.
-        llm           — реализация LLMClient (офлайн или с fallback на офлайн).
-        broadcaster   — Broadcaster для публичной трансляции реплик на экран/в лог.
-        rounds        — максимальное число раундов обсуждения (регламент: диалог
-                        укладывается в общий лимит попытки).
-        time_budget_s — бюджет времени на диалог в секундах; при превышении
-                        обсуждение прерывается досрочно (используется time.monotonic()).
-
-    Возвращает Plan — итоговый план покраски с полной стенограммой диалога.
-    Функция спроектирована так, чтобы НИКОГДА не бросать исключение наружу:
-    любая ошибка (сеть, парсинг JSON, неверный формат ответа LLM) перехватывается
-    и приводит к деградации на последний валидный черновик плана.
+    """Runs multi-round online discussion and plan synthesis.
+    
+    Zero Offline Mode: Any LLMConnectionError or TimeoutError is propagated immediately.
     """
-    transcript: List[DialogueTurn] = []
-    working_tasks: List[PaintTask] = copy.deepcopy(draft_tasks)
-    start_time = time.monotonic()
-    deadline = start_time + max(0.0, time_budget_s)
-    _ensure_meaningful_priorities(working_tasks)
+    deadline_ts = time.time() + float(time_budget_s)
+    current_tasks = [copy.deepcopy(t) for t in draft_tasks]
+    agent_roles = ["Академист", "Экспрессионист", "Минималист", "Детализатор"]
+
+    logger.info("Starting online multi-agent dialogue. Budget: %.1fs, rounds: %d.", time_budget_s, rounds)
+
+    for r in range(1, max(0, rounds) + 1):
+        for role in agent_roles:
+            system_p = get_agent_prompt(role)
+            tasks_str = json.dumps([t.to_dict() for t in current_tasks], ensure_ascii=False, indent=2)
+            history_str = "\n".join([f"[{turn.agent}]: {turn.text}" for turn in broadcaster.get_transcript()])
+
+            user_p = (
+                f"User Prompt: {prompt}\n\n"
+                f"Current Tasks (JSON):\n{tasks_str}\n\n"
+                f"Discussion Protocol:\n{history_str or '(discussion started)'}\n\n"
+                "Evaluate flight speed in ARUCO frame, altitude safety (Z <= 4.0m), spray nozzle timing, "
+                "and airspace hold instructions (yield_wait). Provide suggestions JSON if modifying tasks."
+            )
+
+            try:
+                reply_text = _chat_before_deadline(llm, system_p, user_p, deadline_ts)
+            except LLMConnectionError as exc:
+                logger.error("Connection failure during dialogue turn for %s: %s", role, exc)
+                raise
+            except Exception as exc:
+                logger.error("Error during LLM call for %s: %s", role, exc)
+                raise
+
+            turn = DialogueTurn(agent=role, text=reply_text, ts=time.time())
+            broadcaster.emit(turn)
+
+            json_patch = extract_json(reply_text)
+            if json_patch:
+                current_tasks = apply_json_suggestions(current_tasks, json_patch)
+
+    logger.info("Discussion rounds completed. Invoking Coordinator for final plan synthesis.")
+    coord_system_p = get_coordinator_prompt()
+    final_tasks_str = json.dumps([t.to_dict() for t in current_tasks], ensure_ascii=False, indent=2)
+    full_history_str = "\n".join([f"[{turn.agent}]: {turn.text}" for turn in broadcaster.get_transcript()])
+
+    coord_user_p = (
+        f"Original Request: {prompt}\n\n"
+        f"Agreed Tasks:\n{final_tasks_str}\n\n"
+        f"Full Transcript:\n{full_history_str}\n\n"
+        "Generate single valid JSON with 'cells' and 'flight_commands' arrays for PikoClaw swarm execution in ARUCO frame."
+    )
 
     try:
-        intro = DialogueTurn(
-            agent="Система",
-            text=(
-                f"Получен промпт задания: «{prompt}». Начинаем публичное обсуждение плана "
-                f"покраски рядом из {len(working_tasks)} ячеек. В диалоге участвуют "
-                f"@Академист, @Экспрессионист, @Минималист и @Детализатор."
-            ),
-        )
-        broadcaster.emit(intro)
-        transcript.append(intro)
+        coord_reply = _chat_before_deadline(llm, coord_system_p, coord_user_p, deadline_ts)
+    except LLMConnectionError as exc:
+        logger.error("Connection failure during Coordinator synthesis: %s", exc)
+        raise
+    except Exception as exc:
+        logger.error("Error during Coordinator LLM call: %s", exc)
+        raise
 
-        previous_round_summary = "(это первый раунд, предыдущих реплик ещё нет)"
+    broadcaster.emit(DialogueTurn(agent="Координатор", text=coord_reply, ts=time.time()))
 
-        for round_index in range(1, rounds + 1):
-            if time.monotonic() - start_time >= time_budget_s:
-                broadcaster.emit(
-                    DialogueTurn(
-                        agent="Система",
-                        text=f"Бюджет времени диалога ({time_budget_s:.0f} с) исчерпан — переходим к решению координатора.",
-                    )
-                )
-                break
+    coord_json = extract_json(coord_reply)
+    final_cells: List[PaintTask] = []
+    final_flight_commands: List[FlightCommand] = []
 
-            round_lines: List[str] = []
-
-            for persona_name in PERSONA_ORDER:
-                if time.monotonic() - start_time >= time_budget_s:
-                    broadcaster.emit(
-                        DialogueTurn(
-                            agent="Система",
-                            text=f"Бюджет времени диалога исчерпан во время раунда {round_index} — завершаем обсуждение досрочно.",
-                        )
-                    )
-                    break
-
-                persona = PERSONAS[persona_name]
-                user_prompt = (
-                    f"Промпт: {prompt}\n"
-                    f"Текущий план (JSON): {_tasks_to_json(working_tasks)}\n"
-                    f"Высказывания предыдущего раунда: {previous_round_summary}\n"
-                    f"Сейчас раунд {round_index} из {rounds}."
-                )
-
-                try:
-                    reply_text = _chat_before_deadline(
-                        llm,
-                        system_prompt=persona["system_prompt"],
-                        user_prompt=user_prompt,
-                        deadline=deadline,
-                    )
-                except Exception as exc:  # noqa: BLE001 — сбой одной реплики не должен рушить весь диалог
-                    broadcaster.emit(
-                        DialogueTurn(
-                            agent="Система",
-                            text=f"Ошибка получения реплики от @{persona_name}: {exc}. Пропускаем реплику.",
-                        )
-                    )
-                    continue
-
-                turn = DialogueTurn(agent=persona_name, text=reply_text)
-                broadcaster.emit(turn)
-                transcript.append(turn)
-                round_lines.append(f"@{persona_name}: {reply_text}")
-
-                patch = _extract_first_json_object(reply_text)
-                if patch is not None:
+    if isinstance(coord_json, dict):
+        cells_data = coord_json.get("cells", [])
+        if isinstance(cells_data, list):
+            for item in cells_data:
+                if isinstance(item, dict) and "cell" in item:
                     try:
-                        _apply_patch(working_tasks, patch, persona_name, broadcaster)
-                    except Exception as exc:  # noqa: BLE001 — некорректный патч не должен рушить диалог
-                        broadcaster.emit(
-                            DialogueTurn(
-                                agent="Система",
-                                text=f"Не удалось применить патч от @{persona_name}: {exc}. Патч проигнорирован.",
-                            )
+                        t = PaintTask(
+                            cell=str(item["cell"]).strip(),
+                            color=str(item.get("color", "black")).strip().lower(),
+                            duration_s=float(item.get("duration_s", 2.0)),
+                            passes=int(item.get("passes", 1)),
+                            priority=int(item.get("priority", 0)),
+                            x=float(item["x"]) if item.get("x") is not None else None,
+                            y=float(item["y"]) if item.get("y") is not None else None,
+                            z=float(item["z"]) if item.get("z") is not None else None,
+                            note=str(item.get("note", "")).strip(),
                         )
+                        final_cells.append(t)
+                    except (ValueError, TypeError, KeyError) as err:
+                        logger.warning("Error parsing Coordinator cell %s: %s", item, err)
 
-            previous_round_summary = " | ".join(round_lines) if round_lines else previous_round_summary
+        commands_data = coord_json.get("flight_commands", [])
+        if isinstance(commands_data, list):
+            for item in commands_data:
+                if isinstance(item, dict) and "drone_id" in item and "action" in item:
+                    try:
+                        z_val = float(item["z"]) if item.get("z") is not None else None
+                        if z_val is not None:
+                            z_val = min(4.0, max(0.0, z_val))
 
-        # --- Координатор принимает финальное решение -------------------------
-        if time.monotonic() >= deadline:
-            return _safe_plan_from_draft(
-                prompt,
-                working_tasks,
-                transcript,
-                notes="Бюджет диалога исчерпан; возвращена последняя рабочая копия плана.",
-            )
+                        cmd = FlightCommand(
+                            drone_id=str(item["drone_id"]).strip(),
+                            action=str(item["action"]).strip(),
+                            x=float(item["x"]) if item.get("x") is not None else None,
+                            y=float(item["y"]) if item.get("y") is not None else None,
+                            z=z_val,
+                            speed_mps=float(item.get("speed_mps", 1.0)),
+                            duration_s=float(item.get("duration_s", 0.0)),
+                            passes=int(item.get("passes", 1)),
+                            note=str(item.get("note", "")).strip(),
+                        )
+                        final_flight_commands.append(cmd)
+                    except (ValueError, TypeError, KeyError) as err:
+                        logger.warning("Error parsing flight command %s: %s", item, err)
 
-        coordinator_user_prompt = (
-            f"Промпт: {prompt}\n"
-            f"Финальные задачи после обсуждения (JSON): {_tasks_to_json(working_tasks)}\n"
-            f"Полная стенограмма диалога: {' || '.join(f'{t.agent}: {t.text}' for t in transcript)}\n"
-            "Верни СТРОГО JSON финального плана, как описано в системном промпте."
-        )
+    if not final_cells:
+        final_cells = current_tasks
 
-        try:
-            coordinator_reply = _chat_before_deadline(
-                llm,
-                system_prompt=COORDINATOR_PROMPT,
-                user_prompt=coordinator_user_prompt,
-                deadline=deadline,
-            )
-        except Exception as exc:  # noqa: BLE001
-            broadcaster.emit(
-                DialogueTurn(
-                    agent="Система",
-                    text=f"Координатор недоступен ({exc}). Используем последнюю рабочую копию плана без изменений.",
-                )
-            )
-            return _safe_plan_from_draft(
-                prompt, working_tasks, transcript,
-                notes="Fallback: координатор недоступен, план взят из рабочей копии после обсуждения.",
-            )
+    if not final_flight_commands:
+        final_flight_commands = synthesize_default_flight_commands(final_cells)
 
-        coordinator_turn = DialogueTurn(agent="Координатор", text=coordinator_reply)
-        broadcaster.emit(coordinator_turn)
-        transcript.append(coordinator_turn)
-
-        parsed = _extract_first_json_object(coordinator_reply)
-        if parsed is None:
-            broadcaster.emit(
-                DialogueTurn(
-                    agent="Система",
-                    text="Не удалось разобрать JSON координатора — используем безопасный fallback-план.",
-                )
-            )
-            return _safe_plan_from_draft(
-                prompt, working_tasks, transcript,
-                notes="Fallback: JSON координатора не распарсился, план взят из рабочей копии после обсуждения.",
-            )
-
-        try:
-            final_cells = _coordinator_json_to_tasks(
-                parsed,
-                allowed_cells={task.cell for task in working_tasks},
-            )
-        except (KeyError, ValueError, TypeError) as exc:
-            broadcaster.emit(
-                DialogueTurn(
-                    agent="Система",
-                    text=f"JSON координатора невалиден ({exc}) — используем безопасный fallback-план.",
-                )
-            )
-            return _safe_plan_from_draft(
-                prompt, working_tasks, transcript,
-                notes=f"Fallback: JSON координатора невалиден ({exc}).",
-            )
-
-        _ensure_meaningful_priorities(final_cells)
-        final_notes = str(parsed.get("notes", "")) if isinstance(parsed, dict) else ""
-        return Plan(prompt=prompt, cells=final_cells, transcript=transcript, notes=final_notes)
-
-    except Exception as exc:  # noqa: BLE001 — последний рубеж защиты: диалог не должен падать никогда
-        broadcaster.emit(
-            DialogueTurn(
-                agent="Система",
-                text=f"Непредвиденная ошибка диалога ({exc}). Аварийно возвращаем последний известный план.",
-            )
-        )
-        return _safe_plan_from_draft(
-            prompt, working_tasks or draft_tasks, transcript,
-            notes=f"Fallback после непредвиденной ошибки: {exc}",
-        )
-
-
-if __name__ == "__main__":
-    # Небольшая демонстрация без сети — использует офлайн-клиент.
-    from agents.llm_client import OfflineRuleBasedClient
-
-    demo_tasks = [
-        PaintTask(cell="A1", color="black", duration_s=1.5, passes=1),
-        PaintTask(cell="B2", color="red", duration_s=1.0, passes=1),
-        PaintTask(cell="C3", color="blue", duration_s=2.0, passes=1),
-        PaintTask(cell="D4", color="yellow", duration_s=1.2, passes=1),
-    ]
-    demo_broadcaster = Broadcaster(log_path="logs/dialogue_transcript_demo_engine.jsonl")
-    demo_plan = run_dialogue(
-        prompt="нарисуй сокола",
-        draft_tasks=demo_tasks,
-        llm=OfflineRuleBasedClient(seed=1),
-        broadcaster=demo_broadcaster,
-        rounds=2,
-        time_budget_s=30.0,
+    plan = Plan(
+        prompt=prompt,
+        cells=final_cells,
+        flight_commands=final_flight_commands,
+        transcript=broadcaster.get_transcript(),
+        outline_color="black",
+        notes="Online plan synthesized by Sverk LLM under Zero Offline Mode.",
     )
-    print("\nИтоговый план:", demo_plan)
+    return plan

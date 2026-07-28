@@ -1,1 +1,1 @@
-"""Пакет тестов проекта «Рой дронов-художников» (офлайн, без ROS/дрона)."""
+"""Test suite for Sverk PikoClaw Swarm platform."""

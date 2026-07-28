@@ -1,10 +1,30 @@
-"""
-OpenCLaw — программный слой-посредник между решениями мультиагентной
-LLM-системы и физическими исполнительными механизмами дронов «Сверх».
+"""OpenCLaw hardware abstraction and PikoClaw ROS2 / HTTP bridge integration."""
+from openclaw.safety import SafetyMonitor, SafetyViolationError
+from openclaw.pikoclaw_bridge_client import PikoClawBridgeClient, PikoClawBridgeError
+from openclaw.drone_link import (
+    DroneLink,
+    SimulatedDroneLink,
+    LocalDroneLink,
+    PikaClawDroneLink,
+    DroneStatus,
+    DroneTelemetry,
+    DroneTimeoutError,
+    DroneConnectionError,
+)
+from openclaw.middleware import DroneMiddleware
 
-Реализован поверх высокоуровневого API `sverk_interfaces` (см.
-https://github.com/sverk-tech/sverk-ros2). Архитектурно повторяет
-уже существующий в фреймворке мост `web/ros2_mcp` (HTTP/MCP-сервер с
-policy-движком для LLM-агентов) — см. docs/ARCHITECTURE_CONTRACT.md и
-sverk_code.md, раздел «Почему OpenCLaw устроен именно так».
-"""
+__all__ = [
+    "SafetyMonitor",
+    "SafetyViolationError",
+    "PikoClawBridgeClient",
+    "PikoClawBridgeError",
+    "DroneLink",
+    "SimulatedDroneLink",
+    "LocalDroneLink",
+    "PikaClawDroneLink",
+    "DroneStatus",
+    "DroneTelemetry",
+    "DroneTimeoutError",
+    "DroneConnectionError",
+    "DroneMiddleware",
+]

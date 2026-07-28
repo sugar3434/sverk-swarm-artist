@@ -1,178 +1,119 @@
-"""
-Safety — программные проверки безопасности, требуемые Регламентом
-(разделы 2.6 «Технический регламент беспилотных аппаратов» и
-2.8 «Общие правила безопасности»).
+"""Safety monitoring and regulation compliance module for Sverk PikoClaw Swarm.
 
-Это ДОПОЛНЕНИЕ к штатным механизмам sverk-ros2 (RC kill switch в
-offboard_control, Failsafe при потере сигнала — п. 2.6.4/2.6.11), а не их
-замена. См. docs/ARCHITECTURE_CONTRACT.md.
+Enforces physical and competition constraints:
+- Preflight battery percentage >= 40.0%
+- Maximum flight ceiling altitude <= 4.0 m
+- Watchdog timer for total mission duration: 15 minutes (900 s)
+- Emergency kill function to power off all drones in the swarm.
 """
 from __future__ import annotations
 
 import logging
-import math
-import threading
 import time
-from dataclasses import dataclass, field
-from typing import Callable, List, Optional
-
-from openclaw.drone_link import DroneLink, DroneLinkError
+from typing import Any, Dict, Iterable, Union
 
 logger = logging.getLogger("openclaw.safety")
 
-MIN_BATTERY_PCT = 40.0        # Регламент п. 2.6.7: проверка заряда >= 40% перед попыткой
-MAX_ALTITUDE_M = 4.0          # Регламент п. 2.6.2: высота полёта не более 4 м
-ATTEMPT_BUDGET_S = 15 * 60.0  # Регламент п. 2.2: 15 минут на попытку (включая диалог агентов)
 
-# Регламент п. 2.2 требует, чтобы к концу 15 минут дроны были УЖЕ посажены,
-# а не только начали садиться. Поэтому монитор считает бюджет истекшим
-# ЗАРАНЕЕ, оставляя резерв на синхронную посадку всего роя.
-LANDING_RESERVE_S = 30.0
+class SafetyViolationError(RuntimeError, ValueError):
+    """Exception raised when safety regulations or physical bounds are violated."""
+    pass
 
 
-class SafetyViolation(RuntimeError):
-    """Нарушение правил безопасности — попытка должна быть прервана/отклонена."""
-
-
-@dataclass
 class SafetyMonitor:
-    """Централизованный монитор безопасности для всего роя.
+    """Monitors battery levels, flight altitudes, and mission watchdog timer."""
 
-    Используется координатором (`swarm/fleet_coordinator.py`) на трёх этапах:
-      1. `preflight(fleet)` — перед допуском к попытке (заряд, связь).
-      2. `check_altitude(z)` — перед каждой навигационной командой.
-      3. `check_time_budget()` — и на каждой итерации основного цикла, и из
-         сторожевого потока координатора, чтобы лимит гарантированно
-         ловился ДО истечения 15 минут, а не после.
-    Плюс `kill_switch(fleet, reason)` — немедленная остановка ВСЕХ дронов
-    (программный дубль аппаратного KILL SWITCH, Регламент п. 2.6.11/2.8.5).
-    """
+    MIN_BATTERY_PCT: float = 40.0
+    MAX_ALTITUDE_M: float = 4.0
+    MAX_MISSION_TIME_S: float = 900.0  # 15 minutes
 
-    started_at: float = field(default_factory=time.monotonic)
-    budget_s: float = ATTEMPT_BUDGET_S
-    min_battery_pct: float = MIN_BATTERY_PCT
-    max_altitude_m: float = MAX_ALTITUDE_M
-    landing_reserve_s: float = LANDING_RESERVE_S
-    on_violation: Optional[Callable[[str], None]] = None
-    _kill_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    def __init__(
+        self,
+        min_battery_pct: float = MIN_BATTERY_PCT,
+        max_altitude_m: float = MAX_ALTITUDE_M,
+        max_mission_time_s: float = MAX_MISSION_TIME_S,
+    ) -> None:
+        self.min_battery_pct = float(min_battery_pct)
+        self.max_altitude_m = float(max_altitude_m)
+        self.max_mission_time_s = float(max_mission_time_s)
+        self.mission_start_time: float = time.time()
 
-    def _report(self, message: str) -> None:
-        logger.error(message)
-        if self.on_violation is not None:
+    def start_mission(self) -> None:
+        """Resets mission timer."""
+        self.mission_start_time = time.time()
+        logger.info("[SafetyMonitor] Mission timer started (limit: %.1fs).", self.max_mission_time_s)
+
+    def check_mission_time(self, current_time_s: float | None = None) -> float:
+        """Verifies mission watchdog timer. Raises SafetyViolationError if > 15 minutes."""
+        now = current_time_s if current_time_s is not None else time.time()
+        elapsed = now - self.mission_start_time
+        if elapsed > self.max_mission_time_s:
+            logger.critical(
+                "[SafetyMonitor] Mission watchdog triggered! Elapsed %.1fs > max %.1fs.",
+                elapsed, self.max_mission_time_s
+            )
+            raise SafetyViolationError(
+                f"Exceeded maximum mission time of 15 minutes ({elapsed:.1f}s elapsed out of {self.max_mission_time_s}s)."
+            )
+        return elapsed
+
+    def validate_mission_time(self, current_time_s: float | None = None) -> None:
+        """Alias for check_mission_time."""
+        self.check_mission_time(current_time_s=current_time_s)
+
+    def check_preflight_battery(self, battery_pct: float, drone_id: str = "drone") -> bool:
+        """Verifies battery percentage >= 40.0% prior to flight."""
+        if battery_pct < self.min_battery_pct:
+            msg = (
+                f"[{drone_id}] Preflight battery check failed: current battery {battery_pct:.1f}% "
+                f"is below required minimum ({self.min_battery_pct:.1f}%)."
+            )
+            logger.error("[SafetyMonitor] %s", msg)
+            raise SafetyViolationError(msg)
+        logger.info(
+            "[SafetyMonitor] [%s] Preflight battery check passed: %.1f%% >= %.1f%%.",
+            drone_id, battery_pct, self.min_battery_pct
+        )
+        return True
+
+    def validate_preflight(self, drone: Any, drone_id: str = "drone") -> bool:
+        """Validates preflight state of a drone instance."""
+        status = drone.get_status()
+        battery = getattr(status, "battery_pct", None)
+        if battery is None and isinstance(status, dict):
+            battery = status.get("battery_pct", status.get("battery", 100.0))
+        if battery is None:
+            logger.warning("[%s] Could not determine battery percentage, assuming 100%%.", drone_id)
+            battery = 100.0
+        return self.check_preflight_battery(float(battery), drone_id=drone_id)
+
+    def check_altitude(self, z: float, drone_id: str = "drone") -> bool:
+        """Verifies altitude ceiling Z <= 4.0m."""
+        if z > (self.max_altitude_m + 1e-6):
+            msg = (
+                f"[{drone_id}] Altitude violation! Target z={z:.2f}m exceeds "
+                f"maximum allowed ceiling: {self.max_altitude_m:.1f}m."
+            )
+            logger.error("[SafetyMonitor] %s", msg)
+            raise SafetyViolationError(msg)
+        return True
+
+    def validate_altitude(self, z: float | None, drone_id: str = "drone") -> None:
+        """Validates maneuver altitude before execution."""
+        if z is not None:
+            self.check_altitude(float(z), drone_id=drone_id)
+
+    def emergency_kill(self, fleet: Union[Dict[str, Any], Iterable[Any]]) -> None:
+        """Triggers emergency motor disarm (kill) across all drones."""
+        drones = fleet.values() if isinstance(fleet, dict) else fleet
+        logger.critical(">>> [SafetyMonitor] EMERGENCY KILL ACTIVATED FOR ALL DRONES <<<")
+        for drone in drones:
             try:
-                self.on_violation(message)
-            except Exception:  # noqa: BLE001 — отчёт не должен ронять safety-путь
-                pass
-
-    def elapsed_s(self) -> float:
-        return time.monotonic() - self.started_at
-
-    def remaining_s(self) -> float:
-        """Сколько времени осталось ДО жёсткого дедлайна попытки (без резерва)."""
-        return max(0.0, self.budget_s - self.elapsed_s())
-
-    def remaining_flight_s(self) -> float:
-        """Время на ПОЛЕЗНУЮ работу (за вычетом резерва на посадку) —
-        именно по этому значению должно планироваться расписание покраски."""
-        return max(0.0, self.budget_s - self.landing_reserve_s - self.elapsed_s())
-
-    def check_time_budget(self, extra_s: float = 0.0) -> None:
-        """Регламент п. 2.2: 15 минут на всё, включая диалог агентов.
-
-        `extra_s` — сколько секунд займёт действие, которое мы собираемся
-        начать: если оно не успеет завершиться до дедлайна с учётом резерва
-        на посадку — начинать его нельзя (иначе посадка выйдет за 15 минут).
-        """
-        if self.remaining_flight_s() <= extra_s:
-            raise SafetyViolation(
-                f"Истёк лимит попытки {self.budget_s:.0f}с с резервом на посадку "
-                f"{self.landing_reserve_s:.0f}с (Регламент п. 2.2; прошло "
-                f"{self.elapsed_s():.0f}с, требовалось ещё {extra_s:.0f}с) — "
-                "миссия должна быть немедленно свёрнута (посадка)."
-            )
-
-    def check_altitude(self, z: float) -> None:
-        """Регламент п. 2.6.2: высота полёта дронов не более 4 м.
-
-        Отдельно отбрасываются None/NaN/inf и отрицательная высота (команда
-        «лететь под землю» — такая же авария, как и превышение потолка).
-        """
-        if z is None or not math.isfinite(float(z)):
-            raise SafetyViolation(
-                f"Некорректная целевая высота z={z!r} — команда отклонена (п. 2.6.2)"
-            )
-        if z > self.max_altitude_m:
-            raise SafetyViolation(
-                f"Заданная высота {z:.2f}м превышает лимит {self.max_altitude_m:.2f}м "
-                "(Регламент п. 2.6.2)"
-            )
-        if z < 0.0:
-            raise SafetyViolation(
-                f"Заданная высота {z:.2f}м отрицательна (полёт ниже грунта) — команда отклонена"
-            )
-
-    def preflight(self, fleet: List[DroneLink]) -> None:
-        """Проверка перед допуском к попытке — заряд каждого дрона (п. 2.6.7)."""
-        if not fleet:
-            raise SafetyViolation(
-                "Предполётная проверка: рой пуст (ни одного дрона не подключено) — "
-                "попытка невозможна"
-            )
-        problems: List[str] = []
-        for link in fleet:
-            try:
-                link.preflight_check(min_battery_pct=self.min_battery_pct)
-            except DroneLinkError as exc:
-                problems.append(str(exc))
-            except Exception as exc:  # noqa: BLE001 — любой сбой проверки = не допуск к полёту
-                problems.append(
-                    f"[{getattr(link, 'drone_id', '?')}] предполётная проверка сорвалась: {exc!r}"
-                )
-        if problems:
-            for p in problems:
-                self._report(p)
-            raise SafetyViolation(
-                "Предполётная проверка не пройдена:\n" + "\n".join(problems)
-            )
-
-    def kill_switch(self, fleet: List[DroneLink], reason: str) -> List[str]:
-        """Аварийная остановка ВСЕГО роя (Регламент п. 2.6.11, 2.8.3/2.8.6).
-
-        Программный дубль аппаратного RC-перехвата offboard_control. Пытается
-        остановить КАЖДЫЙ дрон независимо — ошибка на одном НЕ прерывает цикл
-        и не мешает остановить остальных. Если emergency_stop не сработал
-        (дрон уже отвалился по ошибке связи), делается вторая попытка через
-        land() — резервный канал.
-
-        Вызовы сериализованы блокировкой: координатор может дёрнуть abort()
-        из нескольких потоков одновременно, а параллельные emergency_stop на
-        одном и том же дроне — гонка по ROS-сервисам.
-
-        Возвращает список drone_id, которые НЕ удалось остановить ни одним
-        каналом (пустой список = весь рой остановлен).
-        """
-        failed: List[str] = []
-        with self._kill_lock:
-            self._report(f"KILL SWITCH активирован: {reason}")
-            for link in fleet:
-                drone_id = getattr(link, "drone_id", "?")
-                try:
-                    link.emergency_stop(land=True)
-                    continue
-                except Exception as exc:  # noqa: BLE001 — обязаны попытаться на каждом
-                    logger.critical("[%s] emergency_stop не удался при KILL SWITCH: %s",
-                                    drone_id, exc)
-                try:  # последний шанс убрать дрон из воздуха
-                    link.land()
-                    logger.warning("[%s] KILL SWITCH: аварийная посадка выполнена "
-                                   "резервным каналом land()", drone_id)
-                except Exception as exc2:  # noqa: BLE001
-                    logger.critical("[%s] резервный land() ТАКЖЕ не удался: %s", drone_id, exc2)
-                    failed.append(drone_id)
-        if failed:
-            self._report(
-                "KILL SWITCH: НЕ удалось программно остановить дроны: "
-                + ", ".join(failed)
-                + " — требуется аппаратный KILL SWITCH с пульта (п. 2.6.11)"
-            )
-        return failed
+                if hasattr(drone, "kill"):
+                    drone.kill()
+                elif hasattr(drone, "emergency_stop"):
+                    drone.emergency_stop(land=True)
+                else:
+                    logger.warning("[SafetyMonitor] Drone object %s has no kill() method.", drone)
+            except Exception as e:
+                logger.error("[SafetyMonitor] Error executing emergency kill on %s: %s", drone, e)
