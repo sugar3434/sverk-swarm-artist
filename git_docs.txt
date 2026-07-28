@@ -1,0 +1,3 @@
+https://github.com/sverk-tech/sverk-ros2
+https://github.com/KVALNF95/arhepelag_piko_claw
+репа с pikaclaw сделайте гитклон к себе на дроны
